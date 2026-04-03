@@ -1,0 +1,22 @@
+{
+  "name": "Tauri Dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    "--net=host",
+    "-e",
+    "DISPLAY=${env:DISPLAY}",
+    "-e",
+    "WAYLAND_DISPLAY=${env:WAYLAND_DISPLAY}",
+    "-e",
+    "XDG_RUNTIME_DIR=${env:XDG_RUNTIME_DIR}",
+    "-v",
+    "${env:XDG_RUNTIME_DIR}/${env:WAYLAND_DISPLAY}:/tmp/${env:WAYLAND_DISPLAY}",
+    "-e",
+    "PULSE_SERVER=unix:${env:XDG_RUNTIME_DIR}/pulse/native",
+    "-v",
+    "${env:XDG_RUNTIME_DIR}/pulse/native:${env:XDG_RUNTIME_DIR}/pulse/native"
+  ],
+  "postCreateCommand": "pnpm install"
+}
