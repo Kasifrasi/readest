@@ -47,10 +47,10 @@ fastlane/metadata/android/en-US/changelogs
 
 # nix
 result*
+/.direnv/
 
 .playwright-mcp/
 .gstack
 
 .claude/worktrees
 .claude/settings.local.json
-
