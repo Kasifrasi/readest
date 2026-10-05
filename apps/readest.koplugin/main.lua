@@ -22,10 +22,19 @@ local ReadestSync = WidgetContainer:new{
 }
 
 local API_CALL_DEBOUNCE_DELAY = 30
--- Delay before the on-open pull runs, so the reader paints and becomes
--- interactive first and rapid book switching coalesces to a single pull for
--- the book you settle on, instead of stacking blocking round-trips (#5006).
-local READER_READY_PULL_DELAY = 1
+-- Delay before a background pull runs (book open, device wake, network back).
+-- Lets the reader paint and become interactive first, gives Wi-Fi a moment to
+-- settle after wake (kosync uses the same 1s), and coalesces rapid triggers
+-- into a single pull for the book you settle on (#5006).
+local BACKGROUND_PULL_DELAY = 1
+
+-- KOReader's "Action when Wi-Fi is off" (Network settings). nil is "prompt",
+-- the default; "turn on" brings Wi-Fi up without asking; "ignore" (Android)
+-- waits for the system to reconnect. Only "prompt" puts a dialog in front of
+-- the reader.
+local function wifiEnableAction()
+    return G_reader_settings:readSetting("wifi_enable_action") or "prompt"
+end
 local SUPABAE_ANON_KEY_BASE64 = "ZXlKaGJHY2lPaUpJVXpJMU5pSXNJblI1Y0NJNklrcFhWQ0o5LmV5SnBjM01pT2lKemRYQmhZbUZ6WlNJc0luSmxaaUk2SW5aaWMzbDRablZ6YW1weFpIaHJhbkZzZVhOaklpd2ljbTlzWlNJNkltRnViMjRpTENKcFlYUWlPakUzTXpReE1qTTJOekVzSW1WNGNDSTZNakEwT1RZNU9UWTNNWDAuM1U1VXFhb3VfMVNnclZlMWVvOXJBcGMwdUtqcWhwUWRVWGh2d1VIbVVmZw=="
 
 ReadestSync.default_settings = {
@@ -40,6 +49,8 @@ ReadestSync.default_settings = {
     expires_at = nil,
     expires_in = nil,
     last_sync_at = nil,
+    localsend_enabled = true,
+    localsend_alias = nil,
 }
 
 -- ── Lifecycle ──────────────────────────────────────────────────────
@@ -47,6 +58,9 @@ ReadestSync.default_settings = {
 function ReadestSync:init()
     self.last_sync_timestamp = 0
     self.settings = G_reader_settings:readSetting("readest_sync", self.default_settings)
+    if self.settings.localsend_enabled == nil then
+        self.settings.localsend_enabled = true
+    end
 
     local meta = dofile(self.path .. "/_meta.lua")
     self.installed_version = meta and meta.version and tostring(meta.version)
@@ -65,6 +79,9 @@ function ReadestSync:init()
     -- uploads it to the user's Readest cloud. Skipped in reader context
     -- (FileManager.instance is nil there).
     self:registerFileDialogButton()
+    -- LocalSend receive (module singleton; re-attaches on context switch).
+    self.localsend = require("readest_localsend")
+    self.localsend:init(self)
 end
 
 -- Register Library actions (Open / Push / Pull) — available in both
@@ -97,21 +114,28 @@ end
 
 function ReadestSync:onReaderReady()
     if self.settings.auto_sync and self.settings.access_token then
-        -- Defer the per-book pull so the reader is interactive first, and keep a
-        -- handle so a rapid book switch cancels it (onCloseWidget) instead of
-        -- stacking blocking round-trips on the UI thread (issue #5006).
-        if self.reader_ready_pull_task then
-            UIManager:unschedule(self.reader_ready_pull_task)
-        end
-        self.reader_ready_pull_task = function()
-            self.reader_ready_pull_task = nil
-            self:pullBookConfig(false)
-            self:pullBookNotes(false)
-            self:pullBookStats(false)
-        end
-        UIManager:scheduleIn(READER_READY_PULL_DELAY, self.reader_ready_pull_task)
+        -- Defer the per-book pull so the reader is interactive first (issue #5006).
+        self:scheduleBackgroundPull(BACKGROUND_PULL_DELAY)
     end
     self:onDispatcherRegisterReaderActions()
+end
+
+-- Schedule the background pull of the open book's config, notes and stats.
+-- Coalesce open/wake/reconnect triggers. All requests run asynchronously,
+-- so stats can start alongside config and notes. Closing cancels the task.
+function ReadestSync:scheduleBackgroundPull(delay)
+    if self.background_pull_task then
+        UIManager:unschedule(self.background_pull_task)
+    end
+    self.background_pull_task = function()
+        self.background_pull_task = nil
+        self:pullBookConfig(false)
+        self:pullBookNotes(false)
+        if self.settings.auto_sync and self.settings.access_token then
+            self:pullBookStats(false)
+        end
+    end
+    UIManager:scheduleIn(delay, self.background_pull_task)
 end
 
 -- Reverse-lookup table: file extension (lowercase) → Readest format
@@ -150,13 +174,34 @@ function ReadestSync:registerFileDialogButton()
                 if not readest_format_for_ext(ext) then return nil end
                 return {
                     {
-                        text = _("Add to Readest"),
+                        text = _("Add to Readest library"),
                         enabled = plugin.settings.access_token ~= nil,
                         callback = function()
                             local fc = FileManager.instance and FileManager.instance.file_chooser
                             local dlg = fc and fc.file_dialog
                             if dlg then UIManager:close(dlg) end
                             plugin:addToReadest(file)
+                        end,
+                    },
+                }
+            end)
+        -- Second row (own registration id): shown only for supported book
+        -- formats, and only once a LocalSend helper binary exists for this
+        -- device (plugin.localsend:init() sets that during plugin init()).
+        FileManager.instance:addFileDialogButtons("readest_send_localsend",
+            function(file, is_file, _book_props)
+                if not is_file then return nil end
+                local ext = file:match("%.([^./\\]+)$")
+                if not readest_format_for_ext(ext) then return nil end
+                if not (plugin.localsend and plugin.localsend:isAvailable()) then return nil end
+                return {
+                    {
+                        text = _("Send to nearby Readest devices"),
+                        callback = function()
+                            local fc = FileManager.instance and FileManager.instance.file_chooser
+                            local dlg = fc and fc.file_dialog
+                            if dlg then UIManager:close(dlg) end
+                            plugin.localsend:sendFile(file)
                         end,
                     },
                 }
@@ -169,57 +214,73 @@ end
 -- action — the only new thing here is computing the partial_md5 from
 -- the file directly, since long-pressing in FileManager doesn't go
 -- through the Library row path.
-function ReadestSync:addToReadest(file)
+function ReadestSync:addToReadest(file, opts)
+    opts = opts or {}
     local lfs    = require("libs/libkoreader-lfs")
     local util   = require("util")
 
     if not self.settings.access_token then
-        UIManager:show(InfoMessage:new{
-            text = _("Sign in to Readest first."), timeout = 3,
-        })
+        if not opts.silent then
+            UIManager:show(InfoMessage:new{
+                text = _("Sign in to Readest first."), timeout = 3,
+            })
+        end
         return
     end
     local attr = lfs.attributes(file)
     if not attr or attr.mode ~= "file" then
-        UIManager:show(InfoMessage:new{
-            text = _("File not found."), timeout = 3,
-        })
+        if not opts.silent then
+            UIManager:show(InfoMessage:new{
+                text = _("File not found."), timeout = 3,
+            })
+        end
         return
     end
     local ext = file:match("%.([^./\\]+)$")
     local format = readest_format_for_ext(ext)
     if not format then
-        UIManager:show(InfoMessage:new{
-            text = _("Unsupported book format."), timeout = 3,
-        })
+        if not opts.silent then
+            UIManager:show(InfoMessage:new{
+                text = _("Unsupported book format."), timeout = 3,
+            })
+        end
         return
     end
 
     -- Hash via util.partialMD5 — same algorithm Readest uses, fast
-    -- (reads small chunks at fixed offsets, no full-file scan).
-    local progress = InfoMessage:new{
-        text = _("Hashing book…"),
-    }
-    UIManager:show(progress)
+    -- (reads small chunks at fixed offsets, no full-file scan). Runs
+    -- unconditionally regardless of opts.silent — only the InfoMessages
+    -- announcing it are gated.
+    local progress
+    if not opts.silent then
+        progress = InfoMessage:new{
+            text = _("Hashing book…"),
+        }
+        UIManager:show(progress)
+    end
     UIManager:nextTick(function()
         local hash = util.partialMD5(file)
-        UIManager:close(progress)
+        if progress then UIManager:close(progress) end
         if not hash then
-            UIManager:show(InfoMessage:new{
-                text = _("Could not read file."), timeout = 3,
-            })
+            if not opts.silent then
+                UIManager:show(InfoMessage:new{
+                    text = _("Could not read file."), timeout = 3,
+                })
+            end
             return
         end
-        self:_addLocalRow(file, hash, format, attr.size)
+        self:_addLocalRow(file, hash, format, attr.size, opts)
     end)
 end
 
-function ReadestSync:_addLocalRow(file, hash, format, _size)
+function ReadestSync:_addLocalRow(file, hash, format, _size, opts)
     local store = self:getLibraryStore()
     if not store then
-        UIManager:show(InfoMessage:new{
-            text = _("Sign in to Readest first."), timeout = 3,
-        })
+        if not (opts and opts.silent) then
+            UIManager:show(InfoMessage:new{
+                text = _("Sign in to Readest first."), timeout = 3,
+            })
+        end
         return
     end
 
@@ -262,12 +323,27 @@ function ReadestSync:_addLocalRow(file, hash, format, _size)
             .. hash:sub(1, 8) .. " to " .. tostring(now))
         local LibraryWidget = require("library.librarywidget")
         if LibraryWidget._menu then LibraryWidget.refresh() end
-        UIManager:show(InfoMessage:new{
-            text = _("Already in your Readest library:") .. " "
-                .. (existing.title or title),
-            timeout = 2,
-        })
+        if not (opts and opts.silent) then
+            UIManager:show(InfoMessage:new{
+                text = _("Already in your Readest library:") .. " "
+                    .. (existing.title or title),
+                timeout = 2,
+            })
+        end
         return
+    end
+
+    -- A sidecar from a previous read is the only metadata available without
+    -- opening the book. When one exists, stamp the fingerprint Readest's
+    -- importBook would (PDF-salted, issue #5411) so peers preserve it; with
+    -- no sidecar, leave meta_hash unset and Readest stamps it on first open.
+    local meta_hash
+    local ok, DocSettings = pcall(require, "docsettings")
+    if ok and DocSettings and DocSettings:hasSidecarFile(file) then
+        local doc_props = DocSettings:open(file):readSetting("doc_props")
+        if doc_props then
+            meta_hash = SyncConfig:computeMetadataHashInfo(doc_props, file).meta_hash
+        end
     end
 
     -- Add as a local-only row (cloud_present defaults to 0). Stamp
@@ -282,6 +358,7 @@ function ReadestSync:_addLocalRow(file, hash, format, _size)
         hash          = hash,
         title         = title,
         format        = format,
+        meta_hash     = meta_hash,
         file_path     = file,
         local_present = 1,
         created_at    = now,
@@ -296,10 +373,12 @@ function ReadestSync:_addLocalRow(file, hash, format, _size)
         .. " local_present=" .. tostring(row and row.local_present))
     local LibraryWidget = require("library.librarywidget")
     if LibraryWidget._menu then LibraryWidget.refresh() end
-    UIManager:show(InfoMessage:new{
-        text = _("Added to Readest:") .. " " .. title,
-        timeout = 2,
-    })
+    if not (opts and opts.silent) then
+        UIManager:show(InfoMessage:new{
+            text = _("Added to Readest:") .. " " .. title,
+            timeout = 2,
+        })
+    end
 end
 
 function ReadestSync:onAddToReadest(file)
@@ -396,6 +475,12 @@ function ReadestSync:_uploadBookRow(store, file, hash, format)
         end
     end
 
+    -- Uploading introduces the book to the fleet, so stamp the same
+    -- fingerprint Readest's importBook would; peers preserve whatever is
+    -- stamped here. getMetaHash keeps an existing fleet value if the row
+    -- already carries one.
+    local meta_hash = SyncConfig:getMetaHash(self.ui, store)
+
     -- Same row shape addToReadest writes, so both entry points produce the
     -- same row for the same book. _clear_fields un-tombstones a previously
     -- deleted book: a bare deleted_at = nil would be dropped by Lua's table
@@ -404,6 +489,7 @@ function ReadestSync:_uploadBookRow(store, file, hash, format)
         hash          = hash,
         title         = title,
         format        = format,
+        meta_hash     = meta_hash,
         file_path     = file,
         local_present = 1,
         created_at    = (existing and existing.created_at) or now,
@@ -450,6 +536,17 @@ end
 -- ── Menu ───────────────────────────────────────────────────────────
 
 function ReadestSync:addToMainMenu(menu_items)
+    -- sorting_hint only appends unlisted plugins. Pin Readest in both
+    -- default orders; KOReader applies user menu-order overrides afterward.
+    for _, path in ipairs({ "ui/elements/reader_menu_order", "ui/elements/filemanager_menu_order" }) do
+        local ok, order = pcall(require, path)
+        if ok and type(order) == "table" and type(order.tools) == "table" then
+            for i = #order.tools, 1, -1 do
+                if order.tools[i] == "readest_sync" then table.remove(order.tools, i) end
+            end
+            table.insert(order.tools, 1, "readest_sync")
+        end
+    end
     menu_items.readest_sync = {
         sorting_hint = "tools",
         text = _("Readest"),
@@ -507,34 +604,6 @@ function ReadestSync:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Push books now"),
-                enabled_func = function()
-                    return self.settings.access_token ~= nil and self.settings.user_id ~= nil
-                end,
-                callback = function()
-                    self:syncBooksLibrary("push", true)
-                end,
-            },
-            {
-                text = _("Pull books now"),
-                enabled_func = function()
-                    return self.settings.access_token ~= nil and self.settings.user_id ~= nil
-                end,
-                callback = function()
-                    self:syncBooksLibrary("pull", true)
-                end,
-            },
-            {
-                text = _("Upload current book to Readest"),
-                enabled_func = function()
-                    return self.settings.access_token ~= nil and self.ui.document ~= nil
-                end,
-                callback = function()
-                    self:uploadCurrentBook()
-                end,
-                separator = true,
-            },
-            {
                 text = _("Push reading progress now"),
                 enabled_func = function()
                     return self.settings.access_token ~= nil and self.ui.document ~= nil
@@ -550,6 +619,15 @@ function ReadestSync:addToMainMenu(menu_items)
                 end,
                 callback = function()
                     self:pullBookConfig(true)
+                end,
+            },
+            {
+                text = _("Upload current book to Readest"),
+                enabled_func = function()
+                    return self.settings.access_token ~= nil and self.ui.document ~= nil
+                end,
+                callback = function()
+                    self:uploadCurrentBook()
                 end,
                 separator = true,
             },
@@ -589,6 +667,25 @@ function ReadestSync:addToMainMenu(menu_items)
                 callback = function()
                     self:showSyncInfo()
                 end,
+                separator = true,
+            },
+            {
+                text = _("Receive via Nearby BookDrop"),
+                enabled_func = function()
+                    return self.localsend:isAvailable()
+                end,
+                checked_func = function()
+                    return self.settings.localsend_enabled == true
+                end,
+                callback = function()
+                    self.localsend:toggle()
+                end,
+            },
+            {
+                text_func = function()
+                    return self.localsend:statusText()
+                end,
+                enabled_func = function() return false end,
                 separator = true,
             },
             {
@@ -636,7 +733,9 @@ end
 
 function ReadestSync:getBookIdentifiers()
     local book_hash = SyncConfig:getDocumentIdentifier(self.ui)
-    local meta_hash = SyncConfig:getMetaHash(self.ui)
+    -- The library store may hold the fleet-stamped meta_hash for this book
+    -- (pulled from the cloud); getMetaHash prefers it over local computation.
+    local meta_hash = SyncConfig:getMetaHash(self.ui, self:getLibraryStore())
     return book_hash, meta_hash
 end
 
@@ -682,6 +781,36 @@ function ReadestSync:showSyncInfo()
     })
 end
 
+-- Gate a pull on connectivity. Returns true when the caller must stop
+-- (offline), false to proceed.
+--
+-- Interactive pulls (menu tap / gesture) go through
+-- NetworkMgr:willRerunWhenOnline, which brings Wi-Fi up per KOReader's
+-- "Action when Wi-Fi is off" setting and reruns the call once connected,
+-- like every other interactive network action in KOReader.
+--
+-- Background pulls (auto sync on book open / device wake) take that path
+-- only when the configured action is silent ("turn on", "ignore"): the user
+-- told KOReader to handle Wi-Fi without asking, so the pull behaves as it
+-- always did. With "prompt" (the default) the same path puts a "Do you want
+-- to turn on Wi-Fi?" box in front of the reader on every open and wake, one
+-- per pull (#4113, #2137, #5838), and a background task must never do that.
+-- So a background pull then skips silently when offline, remembers that it
+-- skipped, and onNetworkConnected reruns it once the device is back online
+-- (KOReader broadcasts NetworkConnected after its own silent "Restore Wi-Fi
+-- connection on resume" completes, and after a manual toggle).
+function ReadestSync:willRerunPullWhenOnline(interactive, callback)
+    if interactive or wifiEnableAction() ~= "prompt" then
+        return NetworkMgr:willRerunWhenOnline(callback)
+    end
+    if NetworkMgr:isOnline() then
+        return false
+    end
+    logger.dbg("ReadestSync: offline; skipping background pull until NetworkConnected")
+    self.pull_pending_offline = true
+    return true
+end
+
 -- ── Config sync ────────────────────────────────────────────────────
 
 function ReadestSync:pushBookConfig(interactive)
@@ -706,7 +835,7 @@ function ReadestSync:pullBookConfig(interactive)
     local book_hash, meta_hash = self:getBookIdentifiers()
     if not book_hash or not meta_hash then return end
 
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookConfig(interactive) end) then
+    if self:willRerunPullWhenOnline(interactive, function() self:pullBookConfig(interactive) end) then
         return
     end
 
@@ -736,7 +865,7 @@ end
 
 function ReadestSync:pullBookStats(interactive)
     logger.dbg("ReadestStats pullBookStats: triggered, interactive=" .. tostring(interactive))
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookStats(interactive) end) then
+    if self:willRerunPullWhenOnline(interactive, function() self:pullBookStats(interactive) end) then
         return
     end
     local client = self:ensureClient(interactive)
@@ -765,7 +894,7 @@ function ReadestSync:pullBookNotes(interactive, full_sync)
     local book_hash, meta_hash = self:getBookIdentifiers()
     if not book_hash or not meta_hash then return end
 
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookNotes(interactive, full_sync) end) then
+    if self:willRerunPullWhenOnline(interactive, function() self:pullBookNotes(interactive, full_sync) end) then
         return
     end
 
@@ -967,14 +1096,28 @@ function ReadestSync:pushOpenBook(interactive)
 end
 
 function ReadestSync:onCloseDocument()
-    if self.settings.auto_sync and self.settings.access_token then
-        NetworkMgr:goOnlineToRun(function()
-            self:pushBookConfig(false)
-            self:pushBookNotes(false)
-            self:pushBookStats(false)
-            self:pushOpenBook(false)
-        end)
+    if not (self.settings.auto_sync and self.settings.access_token) then
+        return
     end
+    local function push()
+        self:pushBookConfig(false)
+        self:pushBookNotes(false)
+        self:pushBookStats(false)
+        self:pushOpenBook(false)
+    end
+    -- The push needs the document, so it cannot be deferred: with "turn on"
+    -- let KOReader bring Wi-Fi up (blocking) as it always did. With anything
+    -- else goOnlineToRun refuses to run offline, so skip without a dialog and
+    -- let the next online push catch up.
+    if wifiEnableAction() == "turn_on" then
+        NetworkMgr:goOnlineToRun(push)
+        return
+    end
+    if not NetworkMgr:isOnline() then
+        logger.dbg("ReadestSync: offline; skipping close-time push")
+        return
+    end
+    push()
 end
 
 function ReadestSync:onReadestPushBooks()
@@ -999,11 +1142,21 @@ end
 
 -- Waking the device with a book already open should pull like reopening
 -- the book does (issue #4924). Delayed because Wi-Fi is usually still
--- coming back up right after wake (kosync uses the same 1s delay); the
--- pull helpers rerun themselves when online if that isn't enough. On
--- devices where Suspend/Resume also fire on focus changes (Android),
--- the debounce keeps this from hammering the API.
+-- coming back up right after wake; with "Action when Wi-Fi is off: prompt"
+-- the pull skips if it isn't, and onNetworkConnected reruns it (KOReader
+-- turns Wi-Fi off on suspend, so on Kobo/Kindle that rerun, once "Restore
+-- Wi-Fi connection on resume" has finished, is the path that actually
+-- pulls). On devices where Suspend/Resume also fire on focus changes
+-- (Android), the debounce keeps this from hammering the API.
 function ReadestSync:onResume()
+    -- Guarded because some tests construct a plugin table without calling
+    -- init() (see onCloseWidget). The service kept running while suspended
+    -- only if the platform doesn't tear down networking on suspend; restart
+    -- unconditionally so a real suspend/resume cycle always ends up in sync
+    -- with the localsend_enabled setting.
+    if self.localsend and self.settings.localsend_enabled and NetworkMgr:isConnected() then
+        self.localsend:startService(true)
+    end
     if not (self.settings.auto_sync and self.settings.access_token and self.ui.document) then
         return
     end
@@ -1012,16 +1165,7 @@ function ReadestSync:onResume()
         return
     end
     self.last_resume_sync_timestamp = now
-    if self.resume_pull_task then
-        UIManager:unschedule(self.resume_pull_task)
-    end
-    self.resume_pull_task = function()
-        self.resume_pull_task = nil
-        self:pullBookConfig(false)
-        self:pullBookNotes(false)
-        self:pullBookStats(false)
-    end
-    UIManager:scheduleIn(1, self.resume_pull_task)
+    self:scheduleBackgroundPull(BACKGROUND_PULL_DELAY)
 end
 
 function ReadestSync:onAnnotationsModified(items)
@@ -1040,19 +1184,48 @@ function ReadestSync:onAnnotationsModified(items)
     end
 end
 
+function ReadestSync:onNetworkConnected()
+    if self.settings.localsend_enabled then
+        self.localsend:startService(true)
+    end
+    -- A background pull (open / wake) was skipped while offline, see
+    -- willRerunPullWhenOnline. Now that the device is online, run it.
+    if not self.pull_pending_offline then
+        return
+    end
+    if not (self.settings.auto_sync and self.settings.access_token and self.ui.document) then
+        return
+    end
+    self.pull_pending_offline = nil
+    self:scheduleBackgroundPull(BACKGROUND_PULL_DELAY)
+end
+
+function ReadestSync:onNetworkDisconnected()
+    self.localsend:stopService()
+end
+
+function ReadestSync:onSuspend()
+    self.localsend:stopService()
+end
+
 function ReadestSync:onCloseWidget()
     if self.delayed_push_task then
         UIManager:unschedule(self.delayed_push_task)
         self.delayed_push_task = nil
     end
-    if self.resume_pull_task then
-        UIManager:unschedule(self.resume_pull_task)
-        self.resume_pull_task = nil
+    if self.background_pull_task then
+        UIManager:unschedule(self.background_pull_task)
+        self.background_pull_task = nil
     end
-    if self.reader_ready_pull_task then
-        UIManager:unschedule(self.reader_ready_pull_task)
-        self.reader_ready_pull_task = nil
-    end
+    -- A skipped pull belongs to the document that was open at the time; the
+    -- next open pulls on its own, so don't carry the flag across books.
+    self.pull_pending_offline = nil
+    -- The LocalSend poll belongs to the singleton service, not to this
+    -- plugin instance, and its closure captures the singleton (which
+    -- survives context switches). Tearing it down here raced the next
+    -- init()'s re-attach and could strand the service with no live poll
+    -- (incoming transfers silently ignored), so leave it running; it stops
+    -- only when the service does (stopService).
 end
 
 function ReadestSync:deletePluginSettings()

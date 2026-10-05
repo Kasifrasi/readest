@@ -24,11 +24,19 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 
 import { useEnv } from '@/context/EnvContext';
+import { useAuth } from '@/context/AuthContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useFileSelector } from '@/hooks/useFileSelector';
 import { useCustomDictionaryStore } from '@/store/customDictionaryStore';
+import {
+  ensureCustomTranslatorsLoaded,
+  getLLMTranslators,
+  useCustomTranslatorStore,
+} from '@/store/customTranslatorStore';
+import { isCustomTranslatorAllowed } from '@/utils/access';
 import { eventDispatcher } from '@/utils/event';
 import { evictProvider, isSystemDictionaryEnabled } from '@/services/dictionaries/registry';
+import { getContextTranslator } from '@/services/dictionaries/providers/contextProvider';
 import { BUILTIN_PROVIDER_IDS } from '@/services/dictionaries/types';
 import {
   clearRememberedLookupApp,
@@ -44,7 +52,7 @@ import {
   isValidUrlTemplate,
 } from '@/services/dictionaries/webSearchTemplates';
 import SubPageHeader from './SubPageHeader';
-import { BoxedList, SettingsRow, SettingsSelect, Tips } from './primitives';
+import { BoxedList, SettingsRow, SettingsSelect, SettingsSwitchRow, Tips } from './primitives';
 
 /** Dictionary popup font-size multipliers, surfaced as percentages (#4443). */
 const FONT_SCALE_OPTIONS = [
@@ -63,8 +71,8 @@ interface CustomDictionariesProps {
 interface ProviderRow {
   id: string;
   label: string;
-  kind: 'builtin' | 'stardict' | 'mdict' | 'dict' | 'slob' | 'web';
-  badge: string;
+  kind: 'builtin' | 'stardict' | 'mdict' | 'dict' | 'slob' | 'bgl' | 'plugin' | 'web';
+  badge?: string;
   imported?: ImportedDictionary;
   /** Set on `kind: 'web'` rows. The shape distinguishes deletable custom
    *  entries (when `builtinWeb` is false) from immutable built-ins. */
@@ -109,6 +117,7 @@ const builtinWebLabel = (id: string, _: (key: string) => string): string => {
 const builtinLabel = (id: string, _: (key: string) => string): string => {
   if (id === BUILTIN_PROVIDER_IDS.wiktionary) return _('Wiktionary');
   if (id === BUILTIN_PROVIDER_IDS.wikipedia) return _('Wikipedia');
+  if (id === BUILTIN_PROVIDER_IDS.context) return _('Context Dictionary');
   if (id === BUILTIN_PROVIDER_IDS.systemDictionary) return _('System Dictionary');
   return id;
 };
@@ -146,7 +155,7 @@ const SortableRow: React.FC<SortableRowProps> = ({
   });
 
   const style: React.CSSProperties = {
-    transform: CSS.Transform.toString(transform),
+    transform: CSS.Translate.toString(transform),
     transition,
     // Keep the row visible while dragging; use a slight opacity dip so the
     // user can tell it's the moving one.
@@ -197,7 +206,7 @@ const SortableRow: React.FC<SortableRowProps> = ({
       {/* End-aligned type badge. Sits just before the toggle so all
           badges form a uniform column regardless of name length, instead
           of trailing the truncated name at a ragged x position. */}
-      <span className='badge badge-sm badge-ghost shrink-0'>{row.badge}</span>
+      {row.badge && <span className='badge badge-sm badge-ghost shrink-0'>{row.badge}</span>}
 
       <input
         type='checkbox'
@@ -265,6 +274,8 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
     reorder,
     setEnabled,
     setFontScale,
+    setAutoPlayPronunciation,
+    setContextTranslatorId,
     addWebSearch,
     updateWebSearch,
     removeWebSearch,
@@ -275,11 +286,25 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
 
   useEffect(() => {
     void loadCustomDictionaries(envConfig).catch(() => {});
+    ensureCustomTranslatorsLoaded(envConfig);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // The context dictionary asks one of the user's OpenAI-compatible custom
+  // translators (#5544), which are a premium feature. Subscribing to the
+  // translators re-renders the row when one is added or removed.
+  const { token } = useAuth();
+  useCustomTranslatorStore((s) => s.translators);
+  const hasPremium = isCustomTranslatorAllowed(token);
+  const llmTranslators = getLLMTranslators();
+  const contextTranslator = hasPremium ? getContextTranslator() : undefined;
+
   const { selectFiles } = useFileSelector(appService, _);
   const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState<{
+    stage: string;
+    percentage: number;
+  } | null>(null);
   // Android only: the dictionary app remembered for the browser-excluding
   // system-lookup chooser (issue #4559). Stays null on every other platform
   // and whenever nothing has been remembered, so the reset row below only
@@ -297,6 +322,16 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
   }, [appService]);
   const handleFontScaleChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
     setFontScale(Number(e.target.value));
+    await saveCustomDictionaries(envConfig);
+  };
+
+  const handleContextTranslatorChange = async (event: React.ChangeEvent<HTMLSelectElement>) => {
+    setContextTranslatorId(event.target.value);
+    await saveCustomDictionaries(envConfig);
+  };
+
+  const handleAutoPlayPronunciationChange = async (enabled: boolean) => {
+    setAutoPlayPronunciation(enabled);
     await saveCustomDictionaries(envConfig);
   };
 
@@ -422,6 +457,20 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
         });
         continue;
       }
+      if (id === BUILTIN_PROVIDER_IDS.context) {
+        rows.push({
+          id,
+          label: builtinLabel(id, _),
+          kind: 'builtin',
+          disabled: !contextTranslator,
+          reason: !hasPremium
+            ? _('Requires Readest Premium.')
+            : !contextTranslator
+              ? _('Add an OpenAI-compatible translator in Custom Translators to use it.')
+              : undefined,
+        });
+        continue;
+      }
       if (id.startsWith('builtin:')) {
         rows.push({
           id,
@@ -479,7 +528,11 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
               ? _('DICT')
               : dict.kind === 'slob'
                 ? _('Slob')
-                : _('StarDict'),
+                : dict.kind === 'bgl'
+                  ? _('Babylon')
+                  : dict.kind === 'plugin'
+                    ? _('Yomitan')
+                    : _('StarDict'),
         imported: dict,
         disabled,
         reason,
@@ -512,6 +565,7 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
   const handleImport = async () => {
     if (importing) return;
     setImporting(true);
+    setImportProgress(null);
     try {
       const result = await selectFiles({ type: 'dictionaries', multiple: true });
       if (result.error) {
@@ -524,7 +578,15 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
       }
       // User cancelled the picker — staying silent is the right call here.
       if (result.files.length === 0) return;
-      const importResult = await appService?.importDictionaries(result.files, dictionaries);
+      const importResult = await appService?.importDictionaries(
+        result.files,
+        dictionaries,
+        ({ stage, completed, total }) => {
+          if (total === undefined || total <= 0) return;
+          const percentage = Math.min(100, Math.max(0, Math.floor((completed / total) * 100)));
+          setImportProgress({ stage, percentage });
+        },
+      );
       if (!importResult) {
         eventDispatcher.dispatch('toast', {
           type: 'error',
@@ -601,7 +663,21 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
           timeout: 4000,
         });
       }
-      if (added === 0 && replaced === 0 && importResult.orphanFiles.length === 0) {
+      for (const error of importResult.importErrors ?? []) {
+        eventDispatcher.dispatch('toast', {
+          type: 'error',
+          message: _('Failed to import dictionary: {{message}}', {
+            message: `${error.name}: ${error.message}`,
+          }),
+          timeout: 4000,
+        });
+      }
+      if (
+        added === 0 &&
+        replaced === 0 &&
+        importResult.orphanFiles.length === 0 &&
+        !importResult.importErrors?.length
+      ) {
         eventDispatcher.dispatch('toast', {
           type: 'info',
           message: _('No new dictionaries were imported'),
@@ -618,6 +694,7 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
       });
     } finally {
       setImporting(false);
+      setImportProgress(null);
     }
   };
 
@@ -785,6 +862,25 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
         </div>
       </div>
 
+      {contextTranslator && (
+        <BoxedList
+          className='mt-4'
+          title={_('Context Dictionary')}
+          description={_(
+            'Explains the selected text as it is used in the passage, in your translation target language.',
+          )}
+        >
+          <SettingsRow label={_('AI Translator')}>
+            <SettingsSelect
+              value={contextTranslator.id}
+              onChange={handleContextTranslatorChange}
+              options={llmTranslators.map((t) => ({ value: t.id, label: t.name }))}
+              ariaLabel={_('AI Translator')}
+            />
+          </SettingsRow>
+        </BoxedList>
+      )}
+
       <BoxedList
         className='mt-4'
         title={_('Appearance')}
@@ -802,6 +898,18 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
         </SettingsRow>
       </BoxedList>
 
+      <BoxedList
+        className='mt-4'
+        title={_('Pronunciation')}
+        description={_('Plays the recording a dictionary bundles with the entry, when it has one.')}
+      >
+        <SettingsSwitchRow
+          label={_('Auto-play Pronunciation')}
+          checked={settings.autoPlayPronunciation ?? false}
+          onChange={() => void handleAutoPlayPronunciationChange(!settings.autoPlayPronunciation)}
+        />
+      </BoxedList>
+
       <div className='mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2'>
         <button
           type='button'
@@ -814,7 +922,7 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
             'transition-colors duration-150',
             'hover:border-base-300 hover:bg-base-300/40',
             'active:bg-base-200/80',
-            'focus-visible:ring-base-content/15 focus-visible:outline-none focus-visible:ring-2',
+            'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2',
             'disabled:cursor-not-allowed disabled:opacity-60',
             'disabled:hover:border-base-200 disabled:hover:bg-base-100',
           )}
@@ -833,8 +941,19 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
           >
             <MdAdd className='h-3.5 w-3.5' />
           </span>
-          <span className='line-clamp-1'>
-            {importing ? _('Importing…') : _('Import Dictionary')}
+          <span className='line-clamp-1' aria-live='polite'>
+            {importing ? (
+              importProgress ? (
+                <>
+                  {importProgress.stage === 'indexing' ? _('Indexing…') : _('Importing…')}
+                  {` ${importProgress.percentage}%`}
+                </>
+              ) : (
+                _('Importing…')
+              )
+            ) : (
+              _('Import Dictionary')
+            )}
           </span>
         </button>
         <button
@@ -847,7 +966,7 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
             'transition-colors duration-150',
             'hover:border-base-300 hover:bg-base-300/40',
             'active:bg-base-200/80',
-            'focus-visible:ring-base-content/15 focus-visible:outline-none focus-visible:ring-2',
+            'focus-visible:ring-base-content/15 focus-visible:outline-hidden focus-visible:ring-2',
           )}
         >
           <span
@@ -899,6 +1018,7 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
         <li>{_('MDict bundles use .mdx files; companion .mdd and .css files are optional.')}</li>
         <li>{_('DICT bundles need a .index file and a .dict.dz file.')}</li>
         <li>{_('Slob bundles need a .slob file.')}</li>
+        <li>{_('Babylon dictionaries are single .bgl files.')}</li>
         <li>{_('Select all the bundle files together when importing.')}</li>
       </Tips>
 
@@ -912,28 +1032,28 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
               {webModal.editingId ? _('Edit Web Search') : _('Add Web Search')}
             </h3>
             <div className='mt-4 space-y-3'>
-              <label className='form-control w-full'>
-                <span className='label-text text-sm'>{_('Name')}</span>
+              <label className='flex flex-col w-full'>
+                <span className='text-sm text-sm'>{_('Name')}</span>
                 <input
                   type='text'
-                  className='input input-bordered input-sm w-full'
+                  className='input input-sm w-full'
                   value={webModal.name}
                   placeholder={_('e.g. Google')}
                   onChange={(e) => setWebModal((m) => (m ? { ...m, name: e.target.value } : m))}
                 />
               </label>
-              <label className='form-control w-full'>
-                <span className='label-text text-sm'>{_('URL Template')}</span>
+              <label className='flex flex-col w-full'>
+                <span className='text-sm text-sm'>{_('URL Template')}</span>
                 <input
                   type='url'
-                  className='input input-bordered input-sm w-full'
+                  className='input input-sm w-full'
                   value={webModal.urlTemplate}
                   placeholder='https://www.google.com/search?q=%WORD%'
                   onChange={(e) =>
                     setWebModal((m) => (m ? { ...m, urlTemplate: e.target.value } : m))
                   }
                 />
-                <span className='label-text-alt text-base-content/60 mt-1 text-xs'>
+                <span className='text-xs text-base-content/60 mt-1 text-xs'>
                   {_('Use %WORD% where the looked-up word should appear.')}
                 </span>
               </label>
@@ -964,11 +1084,11 @@ const CustomDictionaries: React.FC<CustomDictionariesProps> = ({ onBack }) => {
           <div className='modal-box w-11/12 max-w-md'>
             <h3 className='text-base font-semibold'>{_('Edit Dictionary')}</h3>
             <div className='mt-4 space-y-3'>
-              <label className='form-control w-full'>
-                <span className='label-text text-sm'>{_('Name')}</span>
+              <label className='flex flex-col w-full'>
+                <span className='text-sm text-sm'>{_('Name')}</span>
                 <input
                   type='text'
-                  className='input input-bordered input-sm w-full'
+                  className='input input-sm w-full'
                   value={dictModal.name}
                   placeholder={_('Dictionary name')}
                   onChange={(e) => setDictModal((m) => (m ? { ...m, name: e.target.value } : m))}

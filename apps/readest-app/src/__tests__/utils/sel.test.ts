@@ -237,6 +237,88 @@ describe('sel utilities', () => {
       expect(result.dir).toBeDefined();
     });
 
+    // #6390: a tap on a highlighted footnote link opens both the highlight's
+    // toolbar and the footnote popup at the same word. Both used to take the
+    // roomier side and stack on top of each other; the toolbar now takes the
+    // side the footnote popup left free.
+    it.each([
+      ['down', 'up'],
+      ['up', 'down'],
+    ] as const)('takes the other side when %s is taken', async (taken, expected) => {
+      const { getPosition } = await import('@/utils/sel');
+      const mockRange = {
+        getClientRects: () =>
+          [{ top: 300, right: 300, bottom: 320, left: 200 }] as unknown as DOMRectList,
+        commonAncestorContainer: document.createElement('div'),
+      } as unknown as Range;
+      const rect: Rect = { top: 0, right: 1024, bottom: 768, left: 0 };
+
+      expect(getPosition(mockRange, rect, 10).dir).toBe('down');
+      expect(getPosition(mockRange, rect, 10, false, taken).dir).toBe(expected);
+    });
+
+    // #6390: at the page's top edge there is no room above the word for the
+    // toolbar and its style strip, so taking the side the footnote popup left
+    // free only squeezed them into the popup's edge.
+    it.each([
+      ['up', 120, true],
+      ['up', 40, false],
+      ['down', 600, true],
+      ['down', 700, false],
+      ['left', 120, true],
+      ['right', 1000, false],
+    ] as const)('knows whether a %s block fits at %i', async (dir, at, fits) => {
+      const { hasRoomFor } = await import('@/utils/sel');
+      const rect: Rect = { top: 0, right: 1024, bottom: 768, left: 0 };
+      const point = dir === 'up' || dir === 'down' ? { x: 500, y: at } : { x: at, y: 400 };
+      expect(hasRoomFor({ point, dir }, rect, 88, 10)).toBe(fits);
+    });
+
+    // #6390 review: the toolbar only leaves the footnote popup's side when it
+    // actually lands on the other one with room to spare; anything else (a
+    // selection whose other end is off-screen lands on the taken side anyway)
+    // shares the side and has the popup open beyond it.
+    describe('placeToolbar', () => {
+      const rect: Rect = { top: 0, right: 1024, bottom: 768, left: 0 };
+      const at = (dir: 'up' | 'down', y: number) => ({ point: { x: 500, y }, dir });
+
+      it('keeps the usual side when no side is taken', async () => {
+        const { placeToolbar } = await import('@/utils/sel');
+        const place = () => at('down', 300);
+        expect(placeToolbar(place, null, rect, 88, 10)).toEqual({
+          position: at('down', 300),
+          shared: false,
+        });
+      });
+
+      it('takes the free side when it fits there', async () => {
+        const { placeToolbar } = await import('@/utils/sel');
+        const place = (avoid?: string | null) => (avoid ? at('up', 300) : at('down', 320));
+        expect(placeToolbar(place, 'down', rect, 88, 10)).toEqual({
+          position: at('up', 300),
+          shared: false,
+        });
+      });
+
+      it('shares the side when the free side has no room', async () => {
+        const { placeToolbar } = await import('@/utils/sel');
+        const place = (avoid?: string | null) => (avoid ? at('up', 40) : at('down', 60));
+        expect(placeToolbar(place, 'down', rect, 88, 10)).toEqual({
+          position: at('down', 60),
+          shared: true,
+        });
+      });
+
+      it('shares the side when the placement lands on the taken side anyway', async () => {
+        const { placeToolbar } = await import('@/utils/sel');
+        const place = () => at('down', 300);
+        expect(placeToolbar(place, 'down', rect, 88, 10)).toEqual({
+          position: at('down', 300),
+          shared: true,
+        });
+      });
+    });
+
     it('anchors to the on-screen end when the selection start is off-screen (cross-page)', async () => {
       const { getPosition } = await import('@/utils/sel');
       // A selection that spans a page boundary: its first line is on the
@@ -256,6 +338,49 @@ describe('sel utilities', () => {
       // 'down' = anchored below the visible last line, not the off-screen start.
       expect(result.dir).toBe('down');
       expect(result.point.x).toBeGreaterThan(0);
+    });
+
+    it("anchors a multi-page selection to the last segment, in that segment's frame", async () => {
+      const { getPosition } = await import('@/utils/sel');
+      // Two PDF page iframes stacked in scrolled mode; the selection starts on
+      // the upper page and ends on the lower one (a cross-page selection).
+      const makeFrame = (top: number) => {
+        const iframe = document.createElement('iframe');
+        document.body.appendChild(iframe);
+        iframe.getBoundingClientRect = () =>
+          ({ top, left: 100, right: 500, bottom: top + 400, width: 400, height: 400 }) as DOMRect;
+        return iframe.contentDocument!;
+      };
+      const upper = makeFrame(0);
+      const lower = makeFrame(404);
+      const rangeIn = (doc: Document, rect: { top: number; bottom: number }) =>
+        ({
+          getClientRects: () => [{ ...rect, left: 20, right: 120 }] as unknown as DOMRectList,
+          commonAncestorContainer: doc.body,
+          // Marks the mock as a Range for getIframeElement, which walks up from
+          // commonAncestorContainer to the owning iframe.
+          collapse: () => {},
+        }) as unknown as Range;
+      const first = rangeIn(upper, { top: 300, bottom: 320 });
+      const last = rangeIn(lower, { top: 50, bottom: 70 });
+      const selection = {
+        key: 'k',
+        text: 'a b',
+        page: 1,
+        index: 0,
+        range: first,
+        segments: [
+          { range: first, index: 0, text: 'a' },
+          { range: last, index: 1, text: 'b' },
+        ],
+      };
+      const rect: Rect = { top: 0, right: 1024, bottom: 768, left: 0 };
+      const result = getPosition(selection, rect, 10);
+      // Below the last line of the LAST segment: 404 (frame) + 70 + 6.
+      expect(result.dir).toBe('down');
+      expect(result.point.y).toBe(480);
+      expect(result.point.x).toBe(170);
+      document.body.innerHTML = '';
     });
   });
 
@@ -635,6 +760,105 @@ describe('sel utilities', () => {
       const { getWordRangeFromPoint } = await import('@/utils/sel');
       expect(getWordRangeFromPoint(doc, 0, 0)).toBeNull();
       delete (doc as { caretRangeFromPoint?: unknown }).caretRangeFromPoint;
+    });
+  });
+
+  describe('trimRangeWhitespaceAroundPoint', () => {
+    it.each([
+      ['world\u00a0', 'world'],
+      ['日本語\u3000', '日本語'],
+      ['שלום\u00a0', 'שלום'],
+    ])('trims Unicode trailing whitespace from %j', async (source, expected) => {
+      const container = document.createElement('div');
+      const node = document.createTextNode(source);
+      container.appendChild(node);
+      document.body.appendChild(container);
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const { trimRangeWhitespaceAroundPoint } = await import('@/utils/sel');
+
+      expect(trimRangeWhitespaceAroundPoint(range, node, 2)).toBe(true);
+      expect(range.toString()).toBe(expected);
+      expect(range.endContainer).toBe(node);
+      expect(range.endOffset).toBe(expected.length);
+
+      document.body.removeChild(container);
+    });
+
+    it('trims across inline text nodes while preserving the native word range', async () => {
+      const container = document.createElement('div');
+      container.innerHTML = 'Hello wor<em>ld</em><span> \u00a0</span>test';
+      document.body.appendChild(container);
+      const first = container.firstChild!;
+      const emphasized = container.querySelector('em')!.firstChild!;
+      const whitespace = container.querySelector('span')!.firstChild!;
+      const range = document.createRange();
+      range.setStart(first, 6);
+      range.setEnd(whitespace, 2);
+      const { trimRangeWhitespaceAroundPoint } = await import('@/utils/sel');
+
+      expect(range.toString()).toBe('world \u00a0');
+      expect(trimRangeWhitespaceAroundPoint(range, emphasized, 1)).toBe(true);
+      expect(range.toString()).toBe('world');
+      expect(range.endContainer).toBe(emphasized);
+      expect(range.endOffset).toBe(2);
+
+      document.body.removeChild(container);
+    });
+
+    it('preserves a whitespace-only range', async () => {
+      const container = document.createElement('div');
+      const node = document.createTextNode(' \u00a0');
+      container.appendChild(node);
+      document.body.appendChild(container);
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const { trimRangeWhitespaceAroundPoint } = await import('@/utils/sel');
+
+      expect(trimRangeWhitespaceAroundPoint(range, node, 1)).toBe(false);
+      expect(range.toString()).toBe(' \u00a0');
+
+      document.body.removeChild(container);
+    });
+
+    it.each([
+      ['\u00a0', 'non-breaking space'],
+      ['\u2009', 'thin space'],
+      ['\u202f', 'narrow no-break space'],
+      ['\u3000', 'ideographic space'],
+    ])('selects only the clicked side of a %s separator', async (separator) => {
+      const container = document.createElement('div');
+      const node = document.createTextNode(`space${separator}between`);
+      container.appendChild(node);
+      document.body.appendChild(container);
+      const { trimRangeWhitespaceAroundPoint } = await import('@/utils/sel');
+
+      const left = document.createRange();
+      left.selectNodeContents(node);
+      expect(trimRangeWhitespaceAroundPoint(left, node, 2)).toBe(true);
+      expect(left.toString()).toBe('space');
+
+      const right = document.createRange();
+      right.selectNodeContents(node);
+      expect(trimRangeWhitespaceAroundPoint(right, node, 8)).toBe(true);
+      expect(right.toString()).toBe('between');
+
+      document.body.removeChild(container);
+    });
+
+    it('does not reinterpret a hyphenated native selection', async () => {
+      const container = document.createElement('div');
+      const node = document.createTextNode('mother-in-law');
+      container.appendChild(node);
+      document.body.appendChild(container);
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const { trimRangeWhitespaceAroundPoint } = await import('@/utils/sel');
+
+      expect(trimRangeWhitespaceAroundPoint(range, node, 8)).toBe(false);
+      expect(range.toString()).toBe('mother-in-law');
+
+      document.body.removeChild(container);
     });
   });
 });

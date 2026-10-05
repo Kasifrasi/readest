@@ -31,6 +31,14 @@ pub(crate) async fn copy_uri_to_path<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn render_pdf_cover<R: Runtime>(
+    app: AppHandle<R>,
+    payload: RenderPdfCoverRequest,
+) -> Result<RenderPdfCoverResponse> {
+    app.native_bridge().render_pdf_cover(payload)
+}
+
+#[command]
 pub(crate) async fn save_image_to_gallery<R: Runtime>(
     app: AppHandle<R>,
     payload: SaveImageToGalleryRequest,
@@ -47,11 +55,27 @@ pub(crate) async fn use_background_audio<R: Runtime>(
 }
 
 #[command]
-pub(crate) async fn set_text_selection_suppressed<R: Runtime>(
+pub(crate) async fn set_multicast_lock<R: Runtime>(
     app: AppHandle<R>,
-    payload: SetTextSelectionSuppressedRequest,
+    payload: MulticastLockRequest,
 ) -> Result<()> {
-    app.native_bridge().set_text_selection_suppressed(payload)
+    app.native_bridge().set_multicast_lock(payload)
+}
+
+#[command]
+pub(crate) async fn set_selection_suppressed<R: Runtime>(
+    app: AppHandle<R>,
+    payload: SetSelectionSuppressedRequest,
+) -> Result<()> {
+    app.native_bridge().set_selection_suppressed(payload)
+}
+
+#[command]
+pub(crate) async fn read_share_clip_html<R: Runtime>(
+    app: AppHandle<R>,
+    payload: ReadShareClipHtmlRequest,
+) -> Result<ReadShareClipHtmlResponse> {
+    app.native_bridge().read_share_clip_html(payload)
 }
 
 #[command]
@@ -153,6 +177,14 @@ pub(crate) async fn get_safe_area_insets<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn set_screen_wake_lock<R: Runtime>(
+    app: AppHandle<R>,
+    payload: SetScreenWakeLockRequest,
+) -> Result<()> {
+    app.native_bridge().set_screen_wake_lock(payload)
+}
+
+#[command]
 pub(crate) async fn get_screen_brightness<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<GetScreenBrightnessResponse> {
@@ -165,6 +197,27 @@ pub(crate) async fn set_screen_brightness<R: Runtime>(
     payload: SetScreenBrightnessRequest,
 ) -> Result<SetScreenBrightnessResponse> {
     app.native_bridge().set_screen_brightness(payload)
+}
+
+#[command]
+pub(crate) async fn has_ambient_light_sensor<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<HasAmbientLightSensorResponse> {
+    app.native_bridge().has_ambient_light_sensor()
+}
+
+#[command]
+pub(crate) async fn start_ambient_light_updates<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<AmbientLightUpdatesResponse> {
+    app.native_bridge().start_ambient_light_updates()
+}
+
+#[command]
+pub(crate) async fn stop_ambient_light_updates<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<AmbientLightUpdatesResponse> {
+    app.native_bridge().stop_ambient_light_updates()
 }
 
 #[command]
@@ -213,6 +266,11 @@ pub(crate) async fn select_directory<R: Runtime>(
     }
 
     Ok(result)
+}
+
+#[command]
+pub(crate) async fn show_file_picker<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    app.native_bridge().show_file_picker()
 }
 
 #[command]
@@ -290,17 +348,62 @@ pub(crate) async fn refresh_eink_screen<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn is_eink_refresh_supported<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<EinkRefreshSupportedResponse> {
+    app.native_bridge().is_eink_refresh_supported()
+}
+
+#[command]
+pub(crate) async fn update_bookshelf_widget<R: Runtime>(
+    app: AppHandle<R>,
+    payload: UpdateBookshelfWidgetRequest,
+) -> Result<UpdateBookshelfWidgetResponse> {
+    app.native_bridge().update_bookshelf_widget(payload)
+}
+
+#[command]
+pub(crate) async fn get_bookshelf_widget_instances<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<GetBookshelfWidgetInstancesResponse> {
+    app.native_bridge().get_bookshelf_widget_instances()
+}
+
+#[command]
+pub(crate) async fn set_bookshelf_widget_catalog<R: Runtime>(
+    app: AppHandle<R>,
+    payload: BookshelfWidgetCatalog,
+) -> Result<()> {
+    app.native_bridge().set_bookshelf_widget_catalog(payload)
+}
+
+#[command]
 pub(crate) async fn update_reading_widget<R: Runtime>(
     app: AppHandle<R>,
     payload: UpdateReadingWidgetRequest,
-) -> Result<()> {
+) -> Result<UpdateReadingWidgetResponse> {
     app.native_bridge().update_reading_widget(payload)
 }
 
-/// Snapshot a region of the calling webview and return it as binary PNG
-/// (`tauri::ipc::Response`, no JSON encoding) for the mesh page-curl
+#[command]
+pub(crate) async fn get_reading_widget_instances<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<GetReadingWidgetInstancesResponse> {
+    app.native_bridge().get_reading_widget_instances()
+}
+
+#[command]
+pub(crate) async fn set_reading_widget_catalog<R: Runtime>(
+    app: AppHandle<R>,
+    payload: ReadingWidgetCatalog,
+) -> Result<()> {
+    app.native_bridge().set_reading_widget_catalog(payload)
+}
+
+/// Snapshot a region of the calling webview and return it as binary image
+/// bytes (`tauri::ipc::Response`, no JSON encoding) for the mesh page-curl
 /// texture (#555). Platforms without a capture implementation reject,
-/// which the JS side treats as "fall back to the CSS curl".
+/// which the JS side treats as "fall back to the renderer's own turns".
 #[command]
 pub(crate) async fn capture_webview_region<R: Runtime>(
     app: AppHandle<R>,
@@ -311,4 +414,39 @@ pub(crate) async fn capture_webview_region<R: Runtime>(
         .native_bridge()
         .capture_webview_region(&window, payload)?;
     Ok(tauri::ipc::Response::new(png))
+}
+
+/// Freeze the on-screen pixels of a webview region behind a native layer
+/// that `capture_webview_region` does not see, for the two-column page curl
+/// (#6106). iOS only so far; other platforms reject and the JS side keeps
+/// a paper back on the leaf.
+#[command]
+pub(crate) async fn cover_webview_region<R: Runtime>(
+    app: AppHandle<R>,
+    payload: CaptureWebviewRegionRequest,
+) -> Result<CoverWebviewRegionResponse> {
+    app.native_bridge().cover_webview_region(payload)
+}
+
+#[command]
+pub(crate) async fn uncover_webview_region<R: Runtime>(
+    app: AppHandle<R>,
+    payload: UncoverWebviewRegionRequest,
+) -> Result<()> {
+    app.native_bridge().uncover_webview_region(payload)
+}
+
+#[command]
+pub(crate) async fn icloud_container_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<ICloudContainerStatusResponse> {
+    app.native_bridge().icloud_container_status()
+}
+
+#[command]
+pub(crate) async fn icloud_ensure_downloaded<R: Runtime>(
+    app: AppHandle<R>,
+    payload: ICloudEnsureDownloadedRequest,
+) -> Result<ICloudEnsureDownloadedResponse> {
+    app.native_bridge().icloud_ensure_downloaded(payload)
 }

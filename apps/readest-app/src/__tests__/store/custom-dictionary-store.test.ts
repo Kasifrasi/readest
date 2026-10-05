@@ -533,6 +533,62 @@ describe('customDictionaryStore — loadCustomDictionaries reconciliation', () =
     vi.clearAllMocks();
   });
 
+  it('keeps legacy dictionaries visible when the plugin control database is unavailable', async () => {
+    type SettingsState = ReturnType<typeof useSettingsStore.getState>;
+    useCustomDictionaryStore.setState({ dictionaries: [] });
+    useSettingsStore.setState({
+      settings: {
+        customDictionaries: [
+          {
+            id: 'plugin-dict',
+            contentId: 'plugin-dict',
+            kind: 'plugin',
+            name: 'Plugin dictionary',
+            bundleDir: 'plugin-dir',
+            files: { pluginSource: 'plugin.zip' },
+            plugin: {
+              recordVersion: 1,
+              pluginId: 'readest.yomitan',
+              formatId: 'yomitan',
+              sourceFormatVersion: 3,
+              indexVersion: 2,
+              source: { filename: 'plugin.zip', byteSize: 1, sha256: 'a'.repeat(64) },
+            },
+            addedAt: 1,
+          },
+          {
+            id: 'legacy-dict',
+            contentId: 'legacy-dict',
+            kind: 'bgl',
+            name: 'Legacy dictionary',
+            bundleDir: 'legacy-dir',
+            files: { bgl: 'legacy.bgl' },
+            addedAt: 1,
+          },
+        ],
+        dictionarySettings: {
+          providerOrder: ['plugin-dict', 'legacy-dict'],
+          providerEnabled: { 'plugin-dict': true, 'legacy-dict': true },
+          webSearches: [],
+        },
+      } as unknown as SettingsState['settings'],
+    } as unknown as SettingsState);
+    const fakeAppService = {
+      exists: vi.fn().mockResolvedValue(true),
+      openDatabase: vi.fn().mockRejectedValue(new Error('control unavailable')),
+    };
+    const fakeEnv = {
+      getAppService: () => Promise.resolve(fakeAppService),
+    } as unknown as EnvConfigType;
+
+    await useCustomDictionaryStore.getState().loadCustomDictionaries(fakeEnv);
+
+    expect(useCustomDictionaryStore.getState().dictionaries).toEqual([
+      expect.objectContaining({ id: 'plugin-dict', unavailable: true }),
+      expect.not.objectContaining({ id: 'legacy-dict', unavailable: true }),
+    ]);
+  });
+
   it('prunes providerOrder + providerEnabled entries whose customDictionaries row is tombstoned', async () => {
     type SettingsState = ReturnType<typeof useSettingsStore.getState>;
     useSettingsStore.setState({
@@ -649,6 +705,7 @@ describe('customDictionaryStore — loadCustomDictionaries reconciliation', () =
       'builtin:wikipedia',
       'imp-known',
       'builtin:system',
+      'builtin:context',
       'web:builtin:google',
       'web:builtin:urban',
       'web:builtin:merriam-webster',
@@ -764,5 +821,114 @@ describe('customDictionaryStore — fontScale (dictionary popup font size, #4443
 
     await useCustomDictionaryStore.getState().loadCustomDictionaries(fakeEnv);
     expect(useCustomDictionaryStore.getState().settings.fontScale).toBe(1.15);
+  });
+});
+
+describe('customDictionaryStore — autoPlayPronunciation (#6265)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useCustomDictionaryStore.setState({
+      dictionaries: [],
+      settings: {
+        providerOrder: ['local-x'],
+        providerEnabled: { 'local-x': true },
+        webSearches: [],
+      },
+    });
+  });
+
+  it('setAutoPlayPronunciation updates the in-memory setting', () => {
+    const { setAutoPlayPronunciation } = useCustomDictionaryStore.getState();
+    setAutoPlayPronunciation(true);
+    expect(useCustomDictionaryStore.getState().settings.autoPlayPronunciation).toBe(true);
+  });
+
+  it('applyRemoteDictionarySettings overlays a remote autoPlayPronunciation patch', () => {
+    const { applyRemoteDictionarySettings } = useCustomDictionaryStore.getState();
+    applyRemoteDictionarySettings({ autoPlayPronunciation: true });
+    expect(useCustomDictionaryStore.getState().settings.autoPlayPronunciation).toBe(true);
+  });
+
+  it('loadCustomDictionaries defaults autoPlayPronunciation to false when persisted settings omit it', async () => {
+    type SettingsState = ReturnType<typeof useSettingsStore.getState>;
+    useSettingsStore.setState({
+      settings: {
+        customDictionaries: [],
+        dictionarySettings: {
+          providerOrder: ['builtin:wikipedia'],
+          providerEnabled: { 'builtin:wikipedia': true },
+          webSearches: [],
+        },
+      } as unknown as SettingsState['settings'],
+    } as unknown as SettingsState);
+
+    const fakeAppService = { exists: vi.fn().mockResolvedValue(false) };
+    const fakeEnv = {
+      getAppService: () => Promise.resolve(fakeAppService),
+    } as unknown as EnvConfigType;
+
+    await useCustomDictionaryStore.getState().loadCustomDictionaries(fakeEnv);
+    expect(useCustomDictionaryStore.getState().settings.autoPlayPronunciation).toBe(false);
+  });
+
+  it('loadCustomDictionaries preserves a persisted autoPlayPronunciation', async () => {
+    type SettingsState = ReturnType<typeof useSettingsStore.getState>;
+    useSettingsStore.setState({
+      settings: {
+        customDictionaries: [],
+        dictionarySettings: {
+          providerOrder: ['builtin:wikipedia'],
+          providerEnabled: { 'builtin:wikipedia': true },
+          webSearches: [],
+          autoPlayPronunciation: true,
+        },
+      } as unknown as SettingsState['settings'],
+    } as unknown as SettingsState);
+
+    const fakeAppService = { exists: vi.fn().mockResolvedValue(false) };
+    const fakeEnv = {
+      getAppService: () => Promise.resolve(fakeAppService),
+    } as unknown as EnvConfigType;
+
+    await useCustomDictionaryStore.getState().loadCustomDictionaries(fakeEnv);
+    expect(useCustomDictionaryStore.getState().settings.autoPlayPronunciation).toBe(true);
+  });
+});
+
+describe('customDictionaryStore — context dictionary (#5544)', () => {
+  type SettingsState = ReturnType<typeof useSettingsStore.getState>;
+  const fakeEnv = {
+    getAppService: () => Promise.resolve({ exists: vi.fn().mockResolvedValue(false) }),
+  } as unknown as EnvConfigType;
+  const seedPersisted = (dictionarySettings: Record<string, unknown>) =>
+    useSettingsStore.setState({
+      settings: {
+        customDictionaries: [],
+        dictionarySettings,
+      } as unknown as SettingsState['settings'],
+    } as unknown as SettingsState);
+
+  it('appends the context dictionary, disabled, for existing users', async () => {
+    seedPersisted({
+      providerOrder: ['builtin:wiktionary', 'builtin:wikipedia'],
+      providerEnabled: { 'builtin:wiktionary': true, 'builtin:wikipedia': true },
+    });
+    await useCustomDictionaryStore.getState().loadCustomDictionaries(fakeEnv);
+    const { settings } = useCustomDictionaryStore.getState();
+    expect(settings.providerOrder).toContain('builtin:context');
+    expect(settings.providerEnabled['builtin:context']).toBe(false);
+  });
+
+  it('keeps the chosen translator across loads and updates it', async () => {
+    seedPersisted({
+      providerOrder: ['builtin:context'],
+      providerEnabled: { 'builtin:context': true },
+      contextTranslatorId: 'llm-1',
+    });
+    await useCustomDictionaryStore.getState().loadCustomDictionaries(fakeEnv);
+    expect(useCustomDictionaryStore.getState().settings.contextTranslatorId).toBe('llm-1');
+
+    useCustomDictionaryStore.getState().setContextTranslatorId('llm-2');
+    expect(useCustomDictionaryStore.getState().settings.contextTranslatorId).toBe('llm-2');
   });
 });

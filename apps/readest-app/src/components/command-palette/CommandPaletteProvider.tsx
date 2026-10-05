@@ -1,14 +1,16 @@
 'use client';
 
-import React, { createContext, useContext, useState, useCallback, useEffect, useMemo } from 'react';
+import React, { createContext, useContext, useState, useCallback, useMemo } from 'react';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useThemeStore } from '@/store/themeStore';
 import { useEnv } from '@/context/EnvContext';
 import { isTauriAppPlatform } from '@/services/environment';
 import { tauriHandleSetAlwaysOnTop, tauriHandleToggleFullScreen } from '@/utils/window';
+import { nextThemeMode } from '@/utils/ambientLight';
 import { setAboutDialogVisible } from '@/components/AboutWindow';
 import { saveSysSettings } from '@/helpers/settings';
+import { optInTelemetry, optOutTelemetry } from '@/utils/telemetry';
 import { SettingsPanelType } from '@/components/settings/SettingsDialog';
 import {
   CommandItem,
@@ -20,6 +22,7 @@ import {
   getRecentCommands,
   CommandCategory,
 } from '@/services/commandRegistry';
+import useShortcuts from '@/hooks/useShortcuts';
 
 interface CommandPaletteContextValue {
   isOpen: boolean;
@@ -62,9 +65,8 @@ export const CommandPaletteProvider: React.FC<CommandPaletteProviderProps> = ({ 
 
   // action handlers
   const toggleTheme = useCallback(() => {
-    const nextMode = themeMode === 'auto' ? 'light' : themeMode === 'light' ? 'dark' : 'auto';
-    setThemeMode(nextMode);
-  }, [themeMode, setThemeMode]);
+    setThemeMode(nextThemeMode(themeMode, !!appService?.hasAmbientLightSensor));
+  }, [themeMode, setThemeMode, appService?.hasAmbientLightSensor]);
 
   const toggleFullscreen = useCallback(() => {
     tauriHandleToggleFullScreen();
@@ -97,6 +99,13 @@ export const CommandPaletteProvider: React.FC<CommandPaletteProviderProps> = ({ 
   const toggleTelemetry = useCallback(() => {
     const newValue = !settings.telemetryEnabled;
     saveSysSettings(envConfig, 'telemetryEnabled', newValue);
+    // Keep PostHog's consent in step with the setting, exactly as the
+    // settings panel does. Without this the toggle only changed the file.
+    if (newValue) {
+      optInTelemetry();
+    } else {
+      optOutTelemetry();
+    }
   }, [envConfig, settings.telemetryEnabled]);
 
   const openSettingsPanel = useCallback(
@@ -182,21 +191,17 @@ export const CommandPaletteProvider: React.FC<CommandPaletteProviderProps> = ({ 
     [close],
   );
 
-  // keyboard shortcut handler (Ctrl/Cmd+Shift+P)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const isCmdOrCtrl = e.metaKey || e.ctrlKey;
-      if (isCmdOrCtrl && e.shiftKey && e.key.toLowerCase() === 'p') {
-        e.preventDefault();
-        e.stopPropagation();
+  useShortcuts(
+    {
+      onOpenCommandPalette: () => {
         setSettingsDialogOpen(false);
         toggle();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown, { capture: true });
-    return () => window.removeEventListener('keydown', handleKeyDown, { capture: true });
-  }, [toggle, setSettingsDialogOpen]);
+        return true;
+      },
+    },
+    [toggle, setSettingsDialogOpen],
+    { allowInInputs: true, capture: true, requireModifierInInputs: true },
+  );
 
   const value = useMemo(
     () => ({

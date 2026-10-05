@@ -2,7 +2,10 @@ package com.readest.native_bridge
 
 import android.Manifest
 import android.app.Activity
+import android.app.Application
 import android.app.PendingIntent
+import android.appwidget.AppWidgetManager
+import android.os.Bundle
 import android.content.ComponentName
 import android.content.ContentValues
 import android.content.Context
@@ -16,14 +19,22 @@ import android.provider.Settings
 import android.provider.DocumentsContract
 import android.view.View
 import android.view.KeyEvent
+import android.view.RoundedCorner
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.WindowInsetsController
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.pdf.PdfRenderer
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.hardware.input.InputManager
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import android.util.Base64
 import android.view.PixelCopy
 import android.webkit.WebView
@@ -50,17 +61,31 @@ import app.tauri.plugin.Plugin
 import app.tauri.plugin.Invoke
 import org.json.JSONArray
 import java.io.*
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.*
 
 @InvokeArg
 class AuthRequestArgs {
     var authUrl: String? = null
+    var callbackUrl: String? = null
 }
 
 @InvokeArg
 class CopyURIRequestArgs {
     var uri: String? = null
     var dst: String? = null
+}
+
+@InvokeArg
+class RenderPdfCoverArgs {
+    var filePath: String? = null
+    var maxLongEdge: Int = 512
+}
+
+@InvokeArg
+class MulticastLockArgs {
+    var acquire: Boolean = false
 }
 
 @InvokeArg
@@ -88,6 +113,12 @@ class InterceptKeysRequestArgs {
     var backKey: Boolean? = null
     var pageTurnerKeys: Boolean? = null
     var learnMode: Boolean? = null
+}
+
+@InvokeArg
+class SetSelectionSuppressedArgs {
+    var target: String? = null
+    var suppressed: Boolean = false
 }
 
 @InvokeArg
@@ -120,13 +151,21 @@ class PurchaseProductRequestArgs {
     val productId: String? = null
 }
 
+// One grid tile. Gson can't deserialize a union, so this holds the fields of
+// both kinds: a "book" uses hash..coverPath, a "group" uses id..coverPaths.
 @InvokeArg
-class UpdateReadingWidgetBookArgs {
+class UpdateBookshelfWidgetItemArgs {
+    var type: String = ""
     var hash: String = ""
     var title: String = ""
     var author: String = ""
     var percent: Int = 0
+    var showProgress: Boolean = false
     var coverPath: String = ""
+    var id: String = ""
+    var groupBy: String = ""
+    var value: String = ""
+    var coverPaths: List<String> = emptyList()
 }
 
 @InvokeArg
@@ -138,22 +177,40 @@ class CaptureWebviewRegionArgs {
 }
 
 @InvokeArg
-class UpdateReadingWidgetTtsArgs {
+class UpdateBookshelfWidgetTtsArgs {
     var active: Boolean = false
     var playing: Boolean = false
 }
 
 @InvokeArg
-class UpdateReadingWidgetRequestArgs {
-    var books: List<UpdateReadingWidgetBookArgs> = emptyList()
+class UpdateBookshelfWidgetRequestArgs {
+    var appWidgetId: Int = AppWidgetManager.INVALID_APPWIDGET_ID
+    var shelfId: String = ""
+    var items: List<UpdateBookshelfWidgetItemArgs> = emptyList()
     var sectionTitle: String = ""
     var emptyTitle: String = ""
-    // Nullable — omitted from the snapshot when the caller does not send a tts object.
-    // Note: Tauri parseArgs uses Gson for deserialization; a nullable nested @InvokeArg
-    // field is set to null when the key is absent from the JSON payload, which is the
-    // expected behavior. If deserialization issues arise at runtime, fall back to two
-    // flat optional fields (ttsActive: Boolean? / ttsPlaying: Boolean?).
-    var tts: UpdateReadingWidgetTtsArgs? = null
+    // Null when the caller sends no tts object.
+    var tts: UpdateBookshelfWidgetTtsArgs? = null
+}
+
+
+@InvokeArg
+class UpdateReadingWidgetRequestArgs {
+    var appWidgetId: Int = AppWidgetManager.INVALID_APPWIDGET_ID
+    // Empty means "nothing currently reading".
+    var hash: String = ""
+    var title: String = ""
+    var author: String = ""
+    // Numeric value for the progress bar.
+    var percent: Int = 0
+    var coverPath: String = ""
+    // The already-localized text stats to show, in order.
+    var stats: List<String> = emptyList()
+    var headerText: String = ""
+    var emptyTitle: String = ""
+    var isEink: Boolean = false
+    // Null when the caller sends no tts object.
+    var tts: UpdateBookshelfWidgetTtsArgs? = null
 }
 
 data class ProductData(
@@ -189,8 +246,6 @@ interface KeyDownInterceptor {
 )
 class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
     private val implementation = NativeBridge()
-    private var redirectScheme = "readest"
-    private var redirectHost = "auth-callback"
     private var webViewRef: WebView? = null
     private val billingManager by lazy {
         BillingManager(activity)
@@ -201,29 +256,150 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
     // a dead Activity.
     private val pluginScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    // Held while the LocalSend service runs so multicast discovery
+    // announcements are delivered; most Android devices filter multicast
+    // packets without it. Released in onDestroy.
+    private var multicastLock: android.net.wifi.WifiManager.MulticastLock? = null
+
+    // The in-app browser presented by `open_web_browser` (#5775); null when closed.
+    private var activeWebBrowser: WebBrowserController? = null
+
+    private var sensorManager: SensorManager? = null
+    private var ambientLightListening = false
+    private var lastEmittedLux: Float = Float.NaN
+    private val ambientLightListener = object : SensorEventListener {
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+        override fun onSensorChanged(event: SensorEvent?) {
+            val lux = event?.values?.getOrNull(0) ?: return
+            // Skip tiny noise so JS hysteresis is not flooded (~SENSOR_DELAY_NORMAL).
+            if (!lastEmittedLux.isNaN() && abs(lux - lastEmittedLux) < 0.5f) return
+            lastEmittedLux = lux
+            val payload = JSObject()
+            payload.put("lux", lux.toDouble())
+            // Deliberately NOT emitOrQueue: that queue is for one-shot events
+            // like shared-intent that must survive until JS registers. This is
+            // a continuous stream, so a sample nobody is listening for is
+            // worthless and queueing it would grow without bound whenever the
+            // sensor outlives the listener (e.g. the WebView renderer dies).
+            triggerEvent("ambient-light", payload)
+        }
+    }
+
+    // Chromium's Web Gamepad API starts a native polling thread as soon as a
+    // page observes it (#5693). InputManager is event-driven, so use it only to
+    // tell JS when the browser API should be enabled or disabled.
+    private var inputManager: InputManager? = null
+    private var gamepadConnected = false
+    private val gamepadInputListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) = emitGamepadConnection()
+        override fun onInputDeviceRemoved(deviceId: Int) = emitGamepadConnection()
+        override fun onInputDeviceChanged(deviceId: Int) = emitGamepadConnection()
+    }
+
+    private fun hasConnectedGamepad(): Boolean {
+        val inputManager = inputManager ?: return false
+        return hasGamepadDevice(inputManager.inputDeviceIds) { deviceId ->
+            inputManager.getInputDevice(deviceId)?.sources
+        }
+    }
+
+    private fun emitGamepadConnection(force: Boolean = false) {
+        val connected = hasConnectedGamepad()
+        if (!force && connected == gamepadConnected) return
+        gamepadConnected = connected
+        if (!hasListener(GAMEPAD_CONNECTION_EVENT)) return
+
+        val payload = JSObject().apply { put("connected", connected) }
+        triggerEvent(GAMEPAD_CONNECTION_EVENT, payload)
+    }
+
     override fun onDestroy() {
+        stopAmbientLightUpdatesInternal()
+        inputManager?.unregisterInputDeviceListener(gamepadInputListener)
+        inputManager = null
+        try {
+            multicastLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+            // Releasing an unheld lock throws on some OEM builds; ignore.
+        }
+        multicastLock = null
         pluginScope.cancel()
+        activity.application.unregisterActivityLifecycleCallbacks(lifecycleCallbacks)
         instance = null
     }
 
     companion object {
+        private const val GAMEPAD_CONNECTION_EVENT = "gamepad-connection"
         private const val REQUEST_MANAGE_STORAGE = 1001
         private const val FOLDER_PICKER_REQUEST_CODE = 1002
+        private const val FILE_PICKER_REQUEST_CODE = 1003
         var pendingInvoke: Invoke? = null
+        private var pendingAuthCallbackTarget: OAuthCallbackTarget? = null
         var pendingFolderPickerInvoke: Invoke? = null
+        // A file-picker result can be delivered to a MainActivity that was
+        // recreated after the process died behind the system picker (#1217).
+        // onActivityResult then fires before Tauri has instantiated this
+        // plugin, so the raw Intent is stashed here and drained in load().
+        private var pendingFilePickerData: Intent? = null
         private var instance: NativeBridgePlugin? = null
         fun getInstance(): NativeBridgePlugin? = instance
+
+        /** Asks a running app to publish a just-configured widget's snapshot. */
+        fun notifyWidgetConfigured() {
+            instance?.triggerEvent("bookshelf-widget-configured", JSObject())
+        }
+
+        fun deliverActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+            val plugin = instance
+            if (plugin != null) {
+                plugin.handleActivityResult(requestCode, resultCode, data)
+            } else if (requestCode == FILE_PICKER_REQUEST_CODE &&
+                resultCode == Activity.RESULT_OK && data != null) {
+                pendingFilePickerData = data
+            }
+        }
     }
 
     override fun load(webView: WebView) {
         instance = this
         webViewRef = webView
         super.load(webView)
+        inputManager = activity.getSystemService(Context.INPUT_SERVICE) as? InputManager
+        gamepadConnected = hasConnectedGamepad()
+        inputManager?.registerInputDeviceListener(gamepadInputListener, null)
+        activity.application.registerActivityLifecycleCallbacks(lifecycleCallbacks)
         handleIntent(activity.intent)
+        pendingFilePickerData?.let { data ->
+            pendingFilePickerData = null
+            emitFilePickerResult(data)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
         handleIntent(intent)
+    }
+
+    // Tauri declares Plugin.onResume but never registers the observer that calls it.
+    private val lifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
+        override fun onActivityResumed(resumed: Activity) {
+            if (resumed === activity) releaseBrightnessOverride()
+        }
+
+        override fun onActivityCreated(a: Activity, b: Bundle?) {}
+        override fun onActivityStarted(a: Activity) {}
+        override fun onActivityPaused(a: Activity) {}
+        override fun onActivityStopped(a: Activity) {}
+        override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+        override fun onActivityDestroyed(a: Activity) {}
+    }
+
+    // The system owns brightness across a background trip: drop our window
+    // override on resume and keep whatever brightness the system shows now.
+    private fun releaseBrightnessOverride() {
+        val layoutParams = activity.window.attributes
+        layoutParams.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        activity.window.attributes = layoutParams
     }
 
     private fun handleIntent(intent: Intent?) {
@@ -233,19 +409,13 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         // OAuth callback uses a custom scheme on intent.data and is handled
         // separately from any user-shared content.
         intent.data?.let { uri ->
-            val scheme = uri.scheme ?: ""
-            val isReadestAuth = scheme == "readest" && uri.host == "auth-callback"
-            // Google Drive sign-in uses the reverse-DNS "iOS URL scheme"
-            // (com.googleusercontent.apps.<id>:/oauthredirect) registered as a
-            // BROWSABLE deep link; resolve it through the same pending invoke as
-            // the Supabase readest://auth-callback flow.
-            val isGoogleOAuth = scheme.startsWith("com.googleusercontent.apps.")
-            if (isReadestAuth || isGoogleOAuth) {
+            if (pendingAuthCallbackTarget?.matches(uri.toString()) == true) {
                 val result = JSObject().apply {
                     put("redirectUrl", uri.toString())
                 }
                 pendingInvoke?.resolve(result)
                 pendingInvoke = null
+                pendingAuthCallbackTarget = null
                 return
             }
         }
@@ -382,20 +552,53 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                 triggerEvent(event, payload)
             }
         }
+        if (hasListener(GAMEPAD_CONNECTION_EVENT)) {
+            // registerListener can race both initial app hydration and device
+            // changes. Re-query instead of trusting the cached value so an
+            // already-connected controller is always reported immediately.
+            emitGamepadConnection(force = true)
+        }
     }
 
     @Command
     fun auth_with_custom_tab(invoke: Invoke) {
         val args = invoke.parseArgs(AuthRequestArgs::class.java)
+        val callbackTarget = args.callbackUrl?.let(OAuthCallbackTarget::parse)
+        if (callbackTarget == null) {
+            invoke.reject("Invalid OAuth callback URL")
+            return
+        }
         val uri = Uri.parse(args.authUrl)
 
         val customTabsIntent = CustomTabsIntent.Builder().build()
         customTabsIntent.intent.flags = Intent.FLAG_ACTIVITY_NO_HISTORY
 
         Log.d("NativeBridgePlugin", "Launching OAuth URL: ${args.authUrl}")
-        customTabsIntent.launchUrl(activity, uri)
-
         pendingInvoke = invoke
+        pendingAuthCallbackTarget = callbackTarget
+        customTabsIntent.launchUrl(activity, uri)
+    }
+
+    @Command
+    fun set_multicast_lock(invoke: Invoke) {
+        val args = invoke.parseArgs(MulticastLockArgs::class.java)
+        try {
+            if (args.acquire) {
+                if (multicastLock == null) {
+                    val wifi = activity.applicationContext
+                        .getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                    multicastLock = wifi.createMulticastLock("readest-localsend").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                multicastLock?.acquire()
+            } else {
+                multicastLock?.release()
+            }
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "multicast lock failed")
+        }
     }
 
     @Command
@@ -427,6 +630,63 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                 r
             }
             if (isActive) invoke.resolve(ret)
+        }
+    }
+
+    @Command
+    fun render_pdf_cover(invoke: Invoke) {
+        val args = invoke.parseArgs(RenderPdfCoverArgs::class.java)
+        pluginScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    val filePath = args.filePath ?: throw IllegalArgumentException("filePath is required")
+                    val maxLongEdge = args.maxLongEdge.takeIf { it > 0 }?.coerceAtMost(512) ?: 512
+                    val descriptor = if (filePath.startsWith("content://")) {
+                        activity.contentResolver.openFileDescriptor(Uri.parse(filePath), "r")
+                            ?: throw IOException("Failed to open PDF content URI")
+                    } else {
+                        ParcelFileDescriptor.open(File(filePath), ParcelFileDescriptor.MODE_READ_ONLY)
+                    }
+                    descriptor.use { fd ->
+                        PdfRenderer(fd).use { renderer ->
+                            if (renderer.pageCount == 0) throw IOException("PDF has no pages")
+                            renderer.openPage(0).use { page ->
+                                val scale = minOf(
+                                    1f,
+                                    maxLongEdge.toFloat() / maxOf(page.width, page.height).toFloat(),
+                                )
+                                val width = maxOf(1, (page.width * scale).roundToInt())
+                                val height = maxOf(1, (page.height * scale).roundToInt())
+                                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                                try {
+                                    bitmap.eraseColor(Color.WHITE)
+                                    page.render(
+                                        bitmap,
+                                        null,
+                                        null,
+                                        PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY,
+                                    )
+                                    val bytes = ByteArrayOutputStream().use { output ->
+                                        if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 85, output)) {
+                                            throw IOException("Failed to encode PDF cover")
+                                        }
+                                        output.toByteArray()
+                                    }
+                                    JSObject().apply {
+                                        put("coverBase64", Base64.encodeToString(bytes, Base64.NO_WRAP))
+                                        put("coverMime", "image/jpeg")
+                                    }
+                                } finally {
+                                    bitmap.recycle()
+                                }
+                            }
+                        }
+                    }
+                }
+                if (isActive) invoke.resolve(result)
+            } catch (e: Exception) {
+                if (isActive) invoke.reject(e.message ?: "PDF cover rendering failed")
+            }
         }
     }
 
@@ -729,6 +989,20 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         invoke.resolve()
     }
 
+    // Suppress a piece of the OS selection UI. target "menu" (#5427): gate for
+    // the system text-selection floating toolbar — MainActivity consults this
+    // flag in onWindowStartingActionMode; see SelectionMenuSuppressor. target
+    // "gesture" is a no-op here: Android needs no native selection-gesture
+    // gate (native-touch forwarding covers instant highlight).
+    @Command
+    fun set_selection_suppressed(invoke: Invoke) {
+        val args = invoke.parseArgs(SetSelectionSuppressedArgs::class.java)
+        if (args.target == "menu") {
+            SelectionMenuSuppressor.suppressed = args.suppressed
+        }
+        invoke.resolve()
+    }
+
     @Command
     fun lock_screen_orientation(invoke: Invoke) {
       val args = invoke.parseArgs(LockScreenOrientationRequestArgs::class.java)
@@ -761,6 +1035,16 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                 ret.put("right", insets.right / density)
                 ret.put("bottom", insets.bottom / density)
                 ret.put("left", insets.left / density)
+                // Rounded screen corners are not part of the cutout insets; report
+                // the bottom radius so the reader footer can keep clear of the curve.
+                var bottomCornerRadius = 0
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val platformInsets = rootView.rootWindowInsets
+                    val left = platformInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT)?.radius ?: 0
+                    val right = platformInsets?.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT)?.radius ?: 0
+                    bottomCornerRadius = maxOf(left, right)
+                }
+                ret.put("bottomCornerRadius", bottomCornerRadius / density)
             } else {
                 ret.put("top", 0)
                 ret.put("right", 0)
@@ -826,6 +1110,73 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
             ret.put("error", e.message)
         }
         invoke.resolve(ret)
+    }
+
+    @Command
+    fun has_ambient_light_sensor(invoke: Invoke) {
+        val ret = JSObject()
+        try {
+            val sm = activity.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            val sensor = sm.getDefaultSensor(Sensor.TYPE_LIGHT)
+            ret.put("available", sensor != null)
+        } catch (e: Exception) {
+            ret.put("available", false)
+            ret.put("error", e.message)
+        }
+        invoke.resolve(ret)
+    }
+
+    @Command
+    fun start_ambient_light_updates(invoke: Invoke) {
+        val ret = JSObject()
+        try {
+            if (ambientLightListening) {
+                ret.put("success", true)
+                invoke.resolve(ret)
+                return
+            }
+            val sm = activity.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            val sensor = sm.getDefaultSensor(Sensor.TYPE_LIGHT)
+            if (sensor == null) {
+                ret.put("success", false)
+                ret.put("error", "No ambient light sensor")
+                invoke.resolve(ret)
+                return
+            }
+            sensorManager = sm
+            lastEmittedLux = Float.NaN
+            sm.registerListener(ambientLightListener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+            ambientLightListening = true
+            ret.put("success", true)
+        } catch (e: Exception) {
+            ret.put("success", false)
+            ret.put("error", e.message)
+        }
+        invoke.resolve(ret)
+    }
+
+    @Command
+    fun stop_ambient_light_updates(invoke: Invoke) {
+        val ret = JSObject()
+        try {
+            stopAmbientLightUpdatesInternal()
+            ret.put("success", true)
+        } catch (e: Exception) {
+            ret.put("success", false)
+            ret.put("error", e.message)
+        }
+        invoke.resolve(ret)
+    }
+
+    private fun stopAmbientLightUpdatesInternal() {
+        if (!ambientLightListening) return
+        try {
+            sensorManager?.unregisterListener(ambientLightListener)
+        } catch (_: Exception) {
+        }
+        ambientLightListening = false
+        sensorManager = null
+        lastEmittedLux = Float.NaN
     }
 
     @Command
@@ -1016,6 +1367,52 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         }
     }
 
+    // Book-import file picker. Unlike the Tauri dialog plugin this resolves
+    // the invoke immediately and delivers the picked URIs as a
+    // `file-picker-result` event through the pending-event queue: a promise
+    // held across the picker round-trip dies whenever Android tears down the
+    // activity or process while the picker is in the foreground (low-RAM
+    // devices, FireOS — #1217), but a queued event survives until the JS
+    // listener re-registers after any WebView reload.
+    @Command
+    fun show_file_picker(invoke: Invoke) {
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                // Book extensions have no reliable MIME mapping in SAF; the
+                // JS side re-applies the extension whitelist on the result.
+                type = "*/*"
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            }
+            activity.startActivityForResult(intent, FILE_PICKER_REQUEST_CODE)
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("Failed to open file picker: ${e.message}")
+        }
+    }
+
+    private fun emitFilePickerResult(data: Intent) {
+        val uris = mutableListOf<Uri>()
+        data.clipData?.let { clip ->
+            for (i in 0 until clip.itemCount) {
+                clip.getItemAt(i)?.uri?.let { uris.add(it) }
+            }
+        }
+        if (uris.isEmpty()) {
+            data.data?.let { uris.add(it) }
+        }
+        if (uris.isEmpty()) return
+        // ACTION_OPEN_DOCUMENT grants are persistable; keep them so the copy
+        // into the library can happen after a process restart.
+        uris.forEach { tryTakePersistableReadPermission(it) }
+        val payload = JSObject().apply {
+            val arr = JSArray()
+            uris.forEach { arr.put(it.toString()) }
+            put("uris", arr)
+        }
+        emitOrQueue("file-picker-result", payload)
+    }
+
     @Command
     fun select_directory(invoke: Invoke) {
         pendingFolderPickerInvoke = invoke
@@ -1040,6 +1437,10 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
             if (invoke != null) {
                 handleDirectorySelected(data?.data, invoke)
                 pendingFolderPickerInvoke = null
+            }
+        } else if (requestCode == FILE_PICKER_REQUEST_CODE) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                emitFilePickerResult(data)
             }
         }
     }
@@ -1105,24 +1506,80 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
         }
     }
 
+    // A caller-supplied appWidgetId that isn't a currently bound instance of
+    // the given provider would otherwise write a preference/cover entry keyed
+    // by whatever id was given, orphaned since onDeleted only ever fires for
+    // real ids.
+    private fun isBoundWidget(id: Int, providerClass: Class<*>): Boolean {
+        val mgr = AppWidgetManager.getInstance(activity) ?: return false
+        return id in mgr.getAppWidgetIds(ComponentName(activity, providerClass))
+    }
+    private fun isBoundBookshelfWidget(id: Int) = isBoundWidget(id, BookshelfWidgetProvider::class.java)
+    private fun isBoundReadingWidget(id: Int) =
+        isBoundWidget(id, ReadingWidgetProvider::class.java)
+
     @Command
-    fun update_reading_widget(invoke: Invoke) {
-        val args = invoke.parseArgs(UpdateReadingWidgetRequestArgs::class.java)
+    fun update_bookshelf_widget(invoke: Invoke) {
+        val args = invoke.parseArgs(UpdateBookshelfWidgetRequestArgs::class.java)
+        if (!isBoundBookshelfWidget(args.appWidgetId)) {
+            invoke.reject("appWidgetId is not a bound widget")
+            return
+        }
         pluginScope.launch {
-            withContext(Dispatchers.IO) {
-                val books = org.json.JSONArray()
-                for (book in args.books) {
-                    ReadingWidgetStore.writeThumbnail(activity, book.hash, book.coverPath, book.percent)
-                    books.put(
-                        org.json.JSONObject()
-                            .put("hash", book.hash)
-                            .put("title", book.title)
-                            .put("author", book.author)
-                            .put("percent", book.percent)
-                    )
+            val failed = withContext(Dispatchers.IO) {
+                val items = org.json.JSONArray()
+                var failedTiles = 0
+                for (item in args.items) {
+                    // A failure here must never escape pluginScope: an uncaught
+                    // exception kills the process, and the snapshot is republished
+                    // on every library load, so one bad cover or group tile would
+                    // crash the app on every launch. The tile is listed before its
+                    // thumbnail is written, so a failure leaves a placeholder.
+                    try {
+                        if (item.type == "group") {
+                            // The composited cover depends on this widget's own
+                            // filter and mosaic setting, not just the group's
+                            // identity, so two widgets sharing a group (e.g. the
+                            // same "Foundation" series with different settings)
+                            // must not overwrite each other's cover file. "id"
+                            // stays the real group id for the tap intent below.
+                            val coverKey = "${args.appWidgetId}_${item.id}"
+                            items.put(
+                                org.json.JSONObject()
+                                    .put("type", "group")
+                                    .put("id", item.id)
+                                    .put("coverKey", coverKey)
+                                    .put("groupBy", item.groupBy)
+                                    .put("value", item.value)
+                            )
+                            if (!BookshelfWidgetStore.writeGroupTileThumbnail(activity, coverKey, item.coverPaths)) {
+                                failedTiles++
+                            }
+                        } else {
+                            items.put(
+                                org.json.JSONObject()
+                                    .put("type", "book")
+                                    .put("hash", item.hash)
+                                    .put("title", item.title)
+                                    .put("author", item.author)
+                                    .put("percent", item.percent)
+                                    .put("showProgress", item.showProgress)
+                            )
+                            if (!BookshelfWidgetStore.writeThumbnail(
+                                    activity, item.hash, item.coverPath, item.percent, item.showProgress
+                                )
+                            ) {
+                                failedTiles++
+                            }
+                        }
+                    } catch (e: Exception) {
+                        failedTiles++
+                        Log.w("NativeBridgePlugin", "widget ${item.type} tile failed for ${item.id.ifEmpty { item.hash }}", e)
+                    }
                 }
                 val snapshot = org.json.JSONObject()
-                    .put("books", books)
+                    .put("shelfId", args.shelfId)
+                    .put("items", items)
                     .put("sectionTitle", args.sectionTitle)
                     .put("emptyTitle", args.emptyTitle)
                 args.tts?.let { tts ->
@@ -1133,10 +1590,114 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                             .put("playing", tts.playing)
                     )
                 }
-                ReadingWidgetStore.writeSnapshot(activity, snapshot.toString())
+                // Removed while its covers were written: onDeleted has already
+                // cleared it, and nothing would clear a snapshot written now.
+                if (isBoundBookshelfWidget(args.appWidgetId)) {
+                    BookshelfWidgetStore.writeSnapshot(activity, args.appWidgetId, snapshot.toString())
+                }
+                failedTiles
             }
-            if (isActive) invoke.resolve()
+            // Tiles whose cover was missing or failed, so the caller retries them.
+            if (isActive) invoke.resolve(JSObject().put("failed", failed))
         }
+    }
+
+    @Command
+    fun get_bookshelf_widget_instances(invoke: Invoke) {
+        val mgr = AppWidgetManager.getInstance(activity)
+        val ids = mgr?.getAppWidgetIds(ComponentName(activity, BookshelfWidgetProvider::class.java))
+            ?: IntArray(0)
+        val instances = org.json.JSONArray()
+        for (id in ids) {
+            val settings = BookshelfWidgetStore.readInstanceSettings(activity, id)
+            instances.put(
+                org.json.JSONObject()
+                    .put("appWidgetId", id)
+                    .put("shelfId", settings.shelfId)
+                    .put("gridRows", settings.gridRows)
+                    .put("gridColumns", settings.gridColumns)
+            )
+        }
+        val ret = JSObject()
+        ret.put("instances", instances)
+        invoke.resolve(ret)
+    }
+
+    // The configure screen can't read the app's settings, so the app publishes
+    // its shelves and the screen's translated labels here.
+    @Command
+    fun set_bookshelf_widget_catalog(invoke: Invoke) {
+        BookshelfWidgetStore.writeCatalog(activity, invoke.getArgs().toString())
+        invoke.resolve()
+    }
+
+    @Command
+    fun update_reading_widget(invoke: Invoke) {
+        val args = invoke.parseArgs(UpdateReadingWidgetRequestArgs::class.java)
+        if (!isBoundReadingWidget(args.appWidgetId)) {
+            invoke.reject("appWidgetId is not a bound widget")
+            return
+        }
+        pluginScope.launch {
+            val failed = withContext(Dispatchers.IO) {
+                val snapshot = org.json.JSONObject()
+                    .put("emptyTitle", args.emptyTitle)
+                    .put("headerText", args.headerText)
+                    .put("isEink", args.isEink)
+                var failedCover = 0
+                if (args.hash.isNotEmpty()) {
+                    snapshot.put("hash", args.hash)
+                        .put("title", args.title)
+                        .put("author", args.author)
+                        .put("percent", args.percent)
+                        .put("stats", org.json.JSONArray(args.stats))
+                    try {
+                        if (!ReadingWidgetStore.writeCover(activity, args.hash, args.coverPath)) {
+                            failedCover = 1
+                        }
+                    } catch (e: Exception) {
+                        failedCover = 1
+                        Log.w("NativeBridgePlugin", "reading widget cover failed for ${args.hash}", e)
+                    }
+                }
+                args.tts?.let { tts ->
+                    snapshot.put(
+                        "tts",
+                        org.json.JSONObject()
+                            .put("active", tts.active)
+                            .put("playing", tts.playing)
+                    )
+                }
+                // The widget may have been removed while the cover was written; don't orphan its snapshot.
+                if (isBoundReadingWidget(args.appWidgetId)) {
+                    ReadingWidgetStore.writeSnapshot(activity, args.appWidgetId, snapshot.toString())
+                }
+                failedCover
+            }
+            if (isActive) invoke.resolve(JSObject().put("failed", failed))
+        }
+    }
+
+    @Command
+    fun get_reading_widget_instances(invoke: Invoke) {
+        val mgr = AppWidgetManager.getInstance(activity)
+        val ids = mgr?.getAppWidgetIds(ComponentName(activity, ReadingWidgetProvider::class.java))
+            ?: IntArray(0)
+        val instances = org.json.JSONArray()
+        for (id in ids) {
+            instances.put(
+                ReadingWidgetStore.readInstanceSettings(activity, id).toJson().put("appWidgetId", id)
+            )
+        }
+        val ret = JSObject()
+        ret.put("instances", instances)
+        invoke.resolve(ret)
+    }
+
+    @Command
+    fun set_reading_widget_catalog(invoke: Invoke) {
+        ReadingWidgetStore.writeCatalog(activity, invoke.getArgs().toString())
+        invoke.resolve()
     }
 
     // ── Sync passphrase keychain ──────────────────────────────────────
@@ -1511,6 +2072,88 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
     }
 
     /**
+     * Present the in-app browser (#5775). Resolves `{ openBookHash? }` when
+     * the user closes it; downloads are emitted as `web-browser-download`
+     * plugin events while it is open (queued if JS has not registered yet).
+     */
+    @Command
+    fun open_web_browser(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(WebBrowserArgs::class.java)
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Invalid open_web_browser args")
+            return
+        }
+        val controller = WebBrowserController(
+            activity,
+            args,
+            onDownload = { event ->
+                val payload = JSObject()
+                payload.put("url", event.url)
+                payload.put("path", event.path)
+                payload.put("filename", event.filename)
+                payload.put("success", event.success)
+                event.error?.let { payload.put("error", it) }
+                emitOrQueue("web-browser-download", payload)
+            },
+            completion = { hash, page ->
+                activeWebBrowser = null
+                val ret = JSObject()
+                if (hash != null) ret.put("openBookHash", hash)
+                if (page != null) {
+                    val captured = JSObject()
+                    captured.put("url", page.url)
+                    captured.put("html", page.html)
+                    ret.put("page", captured)
+                }
+                invoke.resolve(ret)
+            },
+        )
+        activeWebBrowser = controller
+        controller.show()
+    }
+
+    /** Called only from Rust. The WebView owns cookie scoping, HttpOnly and persistence. */
+    @Command
+    fun web_browser_cookies(invoke: Invoke) {
+        val args = invoke.parseArgs(WebBrowserCookiesArgs::class.java)
+        activity.runOnUiThread {
+            val manager = android.webkit.CookieManager.getInstance()
+            val updates = args.setCookies ?: emptyArray()
+            fun resolve() {
+                val result = JSObject()
+                result.put("cookies", manager.getCookie(args.url) ?: "")
+                invoke.resolve(result)
+            }
+            if (updates.isEmpty()) resolve()
+            else {
+                var pending = updates.size
+                updates.forEach { cookie ->
+                    manager.setCookie(args.url, cookie) {
+                        pending--
+                        if (pending == 0) resolve()
+                    }
+                }
+            }
+        }
+    }
+
+    /** Push an import status into the open browser's banner. */
+    @Command
+    fun set_web_browser_status(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(WebBrowserStatusArgs::class.java)
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "Invalid set_web_browser_status args")
+            return
+        }
+        activity.runOnUiThread {
+            activeWebBrowser?.setStatus(args.state ?: "", args.filename ?: "", args.bookHash)
+        }
+        invoke.resolve()
+    }
+
+    /**
      * Trigger a deep e-ink full screen refresh (GC16 waveform) to clear
      * ghosting. Driven by the page-turner "Refresh Page" action on e-ink
      * Android devices. Runs on the UI thread against the window's decor view;
@@ -1531,6 +2174,30 @@ class NativeBridgePlugin(private val activity: Activity): Plugin(activity) {
                 ret.put("error", e.message ?: "unknown")
             }
             invoke.resolve(ret)
+        }
+    }
+
+    /**
+     * Whether this device exposes a deep e-ink full-refresh mechanism we can
+     * drive. A read-only capability probe against [EinkRefreshController] (class
+     * reflection plus a system-service lookup) — it never drives the panel — so
+     * it is safe to call once at startup to decide whether to offer the "Refresh
+     * Page" / "Auto Full Refresh" options.
+     */
+    @Command
+    fun is_eink_refresh_supported(invoke: Invoke) {
+        // A confirmed-absent vendor hook resolves `supported:false` — JS caches
+        // that as authoritative and keeps the option hidden. An inconclusive read
+        // (a hook the reflection layer could not definitively rule out) is not a
+        // negative: reject so the JS probe drops its cache and retries on the
+        // next mount rather than latching a wrong 'unsupported' for the session.
+        val ret = JSObject()
+        try {
+            ret.put("supported", EinkRefreshController.isSupported(activity.applicationContext))
+            invoke.resolve(ret)
+        } catch (t: Throwable) {
+            Log.e("NativeBridgePlugin", "is_eink_refresh_supported inconclusive", t)
+            invoke.reject("eink capability probe inconclusive")
         }
     }
 
@@ -1620,4 +2287,10 @@ class SecureItemSetArgs {
 @app.tauri.annotation.InvokeArg
 class SecureItemGetArgs {
     lateinit var key: String
+}
+
+@InvokeArg
+class WebBrowserCookiesArgs {
+    lateinit var url: String
+    var setCookies: Array<String>? = null
 }
