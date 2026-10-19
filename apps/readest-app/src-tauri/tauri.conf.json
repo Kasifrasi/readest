@@ -66,6 +66,7 @@
     },
     "linux": {
       "deb": {
+        "desktopTemplate": "readest.desktop.hbs",
         "section": "text",
         "depends": [
           "libgtk-3-0",
@@ -77,6 +78,7 @@
         ]
       },
       "rpm": {
+        "desktopTemplate": "readest.desktop.hbs",
         "depends": [
           "libgtk-3.so.0()(64bit)",
           "libnss3.so()(64bit)",
